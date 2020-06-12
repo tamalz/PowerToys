@@ -69,6 +69,30 @@ public:
     {
         std::unique_lock writeLock(m_lock);
         m_windowMoveHandler.MoveSizeEnd(window, ptScreen, m_workAreaHandler.GetWorkAreasByDesktopId(m_currentDesktopId));
+        RECT windowRect{};
+        ::GetWindowRect(window, &windowRect);
+        UpdatedWindowInformation updatedWindowInfo{};
+        updatedWindowInfo.hwnd = window;
+        updatedWindowInfo.rect = windowRect;
+        const HMONITOR monitor = MonitorFromWindow(window, MONITOR_DEFAULTTONULL);
+        if (monitor)
+        {
+            auto zoneWindow = m_workAreaHandler.GetWorkArea(m_currentDesktopId, monitor);
+            if (zoneWindow)
+            {
+                auto it = m_mapWindows.find(zoneWindow->UniqueId());
+                if (it != m_mapWindows.end())
+                {
+                    it->second.push_back(updatedWindowInfo);
+                }
+                else
+                {
+                    std::vector<UpdatedWindowInformation> updatedFirstWindow{};
+                    updatedFirstWindow.push_back(updatedWindowInfo);
+                    m_mapWindows.emplace(zoneWindow->UniqueId(), updatedFirstWindow);
+                }
+            }
+        }
     }
 
     IFACEMETHODIMP_(void)
@@ -173,7 +197,8 @@ public:
 
     LRESULT WndProc(HWND, UINT, WPARAM, LPARAM) noexcept;
     void OnDisplayChange(DisplayChangeType changeType) noexcept;
-    void AddZoneWindow(HMONITOR monitor, PCWSTR deviceId) noexcept;
+    std::wstring AddZoneWindow(HMONITOR monitor, PCWSTR deviceId) noexcept;
+    void RestoreWindowsDockedMonitor(std::wstring deviceId) noexcept;
 
 protected:
     static LRESULT CALLBACK s_WndProc(HWND, UINT, WPARAM, LPARAM) noexcept;
@@ -248,6 +273,15 @@ private:
         Exit,
         Terminate
     };
+
+    struct UpdatedWindowInformation
+    {
+        HWND hwnd;
+        RECT rect;
+    };
+
+    std::vector<PCWSTR> m_monitorDeviceIds;
+    std::map<std::wstring, std::vector<UpdatedWindowInformation>> m_mapWindows{};
 };
 
 UINT FancyZones::WM_PRIV_VD_INIT = RegisterWindowMessage(L"{469818a8-00fa-4069-b867-a1da484fcd9a}");
@@ -673,16 +707,17 @@ void FancyZones::OnDisplayChange(DisplayChangeType changeType) noexcept
     }
 }
 
-void FancyZones::AddZoneWindow(HMONITOR monitor, PCWSTR deviceId) noexcept
+std::wstring FancyZones::AddZoneWindow(HMONITOR monitor, PCWSTR deviceId) noexcept
 {
     std::unique_lock writeLock(m_lock);
+    std::wstring uniqueId;
 
     if (m_workAreaHandler.IsNewWorkArea(m_currentDesktopId, monitor))
     {
         wil::unique_cotaskmem_string virtualDesktopId;
         if (SUCCEEDED(StringFromCLSID(m_currentDesktopId, &virtualDesktopId)))
         {
-            std::wstring uniqueId = ZoneWindowUtils::GenerateUniqueId(monitor, deviceId, virtualDesktopId.get());
+            uniqueId = ZoneWindowUtils::GenerateUniqueId(monitor, deviceId, virtualDesktopId.get());
 
             // "Turning FLASHING_ZONE option off"
             //const bool flash = m_settings->GetSettings()->zoneSetChange_flashZones;
@@ -699,6 +734,33 @@ void FancyZones::AddZoneWindow(HMONITOR monitor, PCWSTR deviceId) noexcept
             {
                 m_workAreaHandler.AddWorkArea(m_currentDesktopId, monitor, workArea);
                 JSONHelpers::FancyZonesDataInstance().SaveFancyZonesData();
+            }
+        }
+    }
+    return uniqueId;
+}
+
+void FancyZones::RestoreWindowsDockedMonitor(std::wstring deviceId) noexcept
+{
+    auto it = m_mapWindows.find(deviceId);
+    if (it != m_mapWindows.end())
+    {
+        for (auto windowInfo : it->second)
+        {
+            if (IsWindow(windowInfo.hwnd))
+            {
+                SetWindowPos(windowInfo.hwnd,
+                             nullptr,
+                             windowInfo.rect.left,
+                             windowInfo.rect.top,
+                             windowInfo.rect.right - windowInfo.rect.left,
+                             windowInfo.rect.bottom - windowInfo.rect.top,
+                             SWP_NOACTIVATE | SWP_NOZORDER);
+            }
+            else
+            {
+                auto location = std::find_if(it->second.begin(), it->second.end(), [&](const UpdatedWindowInformation w) { return w.hwnd == windowInfo.hwnd; });
+                it->second.erase(location);
             }
         }
     }
@@ -751,7 +813,20 @@ void FancyZones::UpdateZoneWindows() noexcept
                 }
 
                 auto strongThis = reinterpret_cast<FancyZones*>(data);
-                strongThis->AddZoneWindow(monitor, deviceId);
+                auto uniqueDeviceId = strongThis->AddZoneWindow(monitor, deviceId);
+                auto it = std::find(strongThis->m_monitorDeviceIds.begin(), strongThis->m_monitorDeviceIds.end(), deviceId);
+                if (it != strongThis->m_monitorDeviceIds.end())
+                {
+                    // Same monitor found try to get rearrange accordingly
+                    if (!uniqueDeviceId.empty())
+                    {
+                        strongThis->RestoreWindowsDockedMonitor(uniqueDeviceId);
+                    }
+                }
+                else
+                {
+                    strongThis->m_monitorDeviceIds.push_back(deviceId);
+                }
             }
         }
         return TRUE;
